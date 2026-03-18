@@ -1,0 +1,40 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0E0E16;
+  --surface: #16161F;
+  --surface2: #1E1E2A;
+  --border: rgba(255,255,255,0.07);
+  --yellow: #FFD84D;
+  --yellow-dim: rgba(255,216,77,0.15);
+  --yellow-border: rgba(255,216,77,0.25);
+  --green: #4ADE80;
+  --green-dim: rgba(74,222,128,0.1);
+  --green-border: rgba(74,222,128,0.25);
+  --pink: #FF4D8D;
+  --pink-dim: rgba(255,77,141,0.12);
+  --pink-bg: #FFD6E7;
+  --pink-text: #8B1A4A;
+  --purple: #9B59F5;
+  --purple-dim: rgba(155,89,245,0.12);
+  --purple-bg: #E8D5FF;
+  --purple-text: #3D1A6B;
+  --text: #F0EFE8;
+  --text-muted: #8A8A9A;
+  --text-faint: #4A4A5A;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Noto Sans KR', 'Apple SD Gothic Neo', sans-serif;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+button { font-family: inherit; }
+input { font-family: inherit; }
+
+@keyframes cffall {
+  to { top: 110vh; transform: rotate(720deg); opacity: 0; }
+}

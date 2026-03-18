@@ -52,8 +52,23 @@ async function loadData() {
   } catch { return {}; }
 }
 async function persistData(d) {
-  try { await window.storage.set(STORAGE_KEY, JSON.stringify(d), true); return true; }
-  catch { return false; }
+  try {
+    // 저장할 때 타임스탬프 포함
+    const payload = { ...d, _savedAt: Date.now() };
+    await window.storage.set(STORAGE_KEY, JSON.stringify(payload), true);
+    return true;
+  } catch { return false; }
+}
+// 두 데이터를 머지 — 서버꺼가 더 최신이면 서버꺼 우선, 아니면 로컬 유지
+function mergeData(local, remote) {
+  if (!remote) return local;
+  if (!local) return remote;
+  const localTs  = local._savedAt  || 0;
+  const remoteTs = remote._savedAt || 0;
+  // 서버가 더 최신 (다른 사람이 저장한 경우) → 서버 우선
+  if (remoteTs > localTs) return remote;
+  // 내가 더 최신 → 내 것 유지
+  return local;
 }
 
 export default function App() {
@@ -63,8 +78,12 @@ export default function App() {
   const [weekKey, setWeekKey]     = useState(getWeekKey(new Date()));
   const [monthIdx, setMonthIdx]   = useState({ y: new Date().getFullYear(), m: new Date().getMonth() });
   // 투표 로컬 상태 (저장 전 편집용)
-  const [localVotes, setLocalVotes] = useState(null); // null = 서버 데이터 사용
+  const [localVotes, setLocalVotes] = useState(null);
   const [voteEditing, setVoteEditing] = useState(false);
+  // 약속 확정 모달
+  const [confirmModal, setConfirmModal] = useState(null); // dateStr
+  const [confirmTodoInput, setConfirmTodoInput] = useState({ 시은:"", 지수:"" });
+  const [confirmSelected, setConfirmSelected] = useState({ 시은:[], 지수:[] }); // 미리쓴 할일 선택된 id들
   // 완료 날 기록 팝업
   const [completeDayModal, setCompleteDayModal] = useState(null); // dateStr
   const [completeTodoInput, setCompleteTodoInput] = useState({ 시은:"", 지수:"" });
@@ -83,10 +102,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const t = setInterval(() => {
-      if (isSaving.current || Date.now() - lastSaveTs.current < 6000) return;
-      loadData().then(d => { setDataRaw(d); setLastSync(new Date()); });
-    }, 20000);
+    const t = setInterval(async () => {
+      if (isSaving.current) return;
+      const remote = await loadData();
+      setDataRaw(prev => {
+        const merged = mergeData(prev, remote);
+        // 서버가 더 최신이면 업데이트
+        if ((remote._savedAt||0) > (prev._savedAt||0)) {
+          setLastSync(new Date());
+          return merged;
+        }
+        return prev;
+      });
+    }, 15000);
     return () => clearInterval(t);
   }, []);
 
@@ -102,7 +130,13 @@ export default function App() {
   }, []);
 
   function setData(fn) {
-    setDataRaw(prev => { const next = fn(prev); save(next); return next; });
+    setDataRaw(prev => {
+      const next = fn(prev);
+      // 저장 시 타임스탬프 박아두기
+      const withTs = { ...next, _savedAt: Date.now() };
+      save(withTs);
+      return withTs;
+    });
   }
 
   // ── week 데이터 ──
@@ -150,13 +184,52 @@ export default function App() {
     setVoteEditing(false);
   }
 
-  function toggleConfirm(ds) {
+  function openConfirmModal(ds) {
+    if (isConfirmed(ds)) {
+      // 이미 확정된 경우 → 취소
+      setData(prev => {
+        const w  = prev[weekKey] || {};
+        const c  = w.confirmed || [];
+        return { ...prev, [weekKey]: { ...w, confirmed: c.filter(x=>x!==ds) } };
+      });
+    } else {
+      // 확정 모달 열기
+      setConfirmModal(ds);
+      setConfirmTodoInput({ 시은:"", 지수:"" });
+      setConfirmSelected({ 시은:[], 지수:[] });
+    }
+  }
+
+  function saveConfirm(ds) {
+    // 확정 저장 + 선택된 할일 & 직접입력 dayRecord에 저장
+    const wk = getWeekKey(ds);
     setData(prev => {
-      const w  = prev[weekKey] || {};
-      const c  = w.confirmed || [];
-      const nc = c.includes(ds) ? c.filter(x=>x!==ds) : [...c, ds];
-      return { ...prev, [weekKey]: { ...w, confirmed: nc } };
+      const w   = prev[weekKey] || {};
+      const wkW = prev[wk] || {};
+      const dr  = wkW.dayRecords || {};
+      const dayRec = dr[ds] || {};
+      const newRec = { ...dayRec };
+      MEMBERS.forEach(mb => {
+        const existing = newRec[mb] || [];
+        const todos = (w.todos || {})[mb] || [];
+        // 선택된 미리쓴 할일
+        const selected = confirmSelected[mb]
+          .map(id => todos.find(t => t.id === id))
+          .filter(Boolean)
+          .map(t => ({ id: Date.now() + Math.random(), text: t.text }));
+        // 직접 입력
+        const direct = confirmTodoInput[mb].trim()
+          ? [{ id: Date.now() + Math.random(), text: confirmTodoInput[mb].trim() }]
+          : [];
+        newRec[mb] = [...existing, ...selected, ...direct];
+      });
+      return {
+        ...prev,
+        [weekKey]: { ...w, confirmed: [...(w.confirmed||[]), ds] },
+        [wk]: { ...wkW, dayRecords: { ...dr, [ds]: newRec } },
+      };
     });
+    setConfirmModal(null);
   }
 
   function toggleComplete(ds) {
@@ -260,6 +333,64 @@ export default function App() {
           {Array.from({length:40}).map((_,i)=>(
             <div key={i} style={{position:"absolute",left:`${Math.random()*100}%`,top:"-10px",width:7,height:7,borderRadius:Math.random()>.5?"50%":"2px",background:["#FFD84D","#FF4D8D","#9B59F5","#4ADE80","#fff"][i%5],animation:`cffall ${.7+Math.random()*.9}s ${Math.random()*.5}s linear forwards`}}/>
           ))}
+        </div>
+      )}
+
+      {/* ── 약속 확정 모달 ── */}
+      {confirmModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",zIndex:500,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+          <div style={{background:"var(--surface)",borderRadius:18,padding:20,width:"100%",maxWidth:420,border:"1px solid rgba(255,77,141,0.3)"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
+              <div style={{fontSize:15,fontWeight:900}}>📌 약속 확정!</div>
+              <button onClick={()=>setConfirmModal(null)} style={{background:"none",border:"none",color:"var(--text-faint)",fontSize:20,cursor:"pointer"}}>×</button>
+            </div>
+            <div style={{fontSize:11,color:"var(--text-muted)",marginBottom:16}}>{fmtFull(confirmModal)} ({getDayLabel(confirmModal)}) — 이날 할 일을 미리 정해봐</div>
+
+            {MEMBERS.map(mb => {
+              const c = M[mb];
+              const todos = (wd.todos || {})[mb] || [];
+              const undoneTodos = todos.filter(t => !t.done);
+              return (
+                <div key={mb} style={{marginBottom:14}}>
+                  <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
+                    <div style={{width:7,height:7,borderRadius:"50%",background:c.accent}}/>
+                    <span style={{fontSize:12,fontWeight:700,color:c.accent}}>{mb}의 할 일</span>
+                  </div>
+
+                  {/* 미리 써둔 할일 선택 */}
+                  {undoneTodos.length > 0 && (
+                    <div style={{marginBottom:8}}>
+                      <div style={{fontSize:10,color:"var(--text-faint)",marginBottom:5}}>할 일 목록에서 선택</div>
+                      <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                        {undoneTodos.map(t => {
+                          const sel = confirmSelected[mb].includes(t.id);
+                          return (
+                            <div key={t.id} onClick={()=>setConfirmSelected(p=>({...p,[mb]:sel?p[mb].filter(x=>x!==t.id):[...p[mb],t.id]}))}
+                              style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",background:sel?`rgba(${mb==="시은"?"255,77,141":"155,89,245"},0.12)`:"rgba(255,255,255,0.04)",border:`1px solid ${sel?c.accent:"rgba(255,255,255,0.08)"}`,borderRadius:9,cursor:"pointer",transition:"all .15s"}}>
+                              <div style={{width:16,height:16,borderRadius:5,border:`2px solid ${sel?c.accent:"rgba(255,255,255,0.2)"}`,background:sel?c.accent:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                                {sel&&<span style={{color:"#fff",fontSize:9}}>✓</span>}
+                              </div>
+                              <span style={{fontSize:11,color:sel?"var(--text)":"var(--text-muted)"}}>{t.text}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 직접 입력 */}
+                  <div style={{display:"flex",gap:6}}>
+                    <input value={confirmTodoInput[mb]} onChange={e=>setConfirmTodoInput(p=>({...p,[mb]:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&e.preventDefault()} placeholder="직접 입력..." style={{flex:1,background:"rgba(255,255,255,0.05)",border:`1px solid ${c.accent}30`,borderRadius:9,padding:"7px 10px",color:"var(--text)",fontSize:11,outline:"none"}}/>
+                  </div>
+                </div>
+              );
+            })}
+
+            <div style={{display:"flex",gap:8,marginTop:4}}>
+              <button onClick={()=>setConfirmModal(null)} style={{flex:1,background:"rgba(255,255,255,0.05)",border:"1px solid var(--border)",borderRadius:11,padding:"10px 0",fontSize:12,fontWeight:700,color:"var(--text-muted)",cursor:"pointer"}}>취소</button>
+              <button onClick={()=>saveConfirm(confirmModal)} style={{flex:2,background:"rgba(255,77,141,0.2)",border:"1px solid rgba(255,77,141,0.4)",borderRadius:11,padding:"10px 0",fontSize:13,fontWeight:900,color:"#FF4D8D",cursor:"pointer"}}>📌 확정하기</button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -471,7 +602,7 @@ export default function App() {
                       {!voteEditing&&(
                         <div style={{display:"flex",gap:4}}>
                           {bothVotedSaved(ds)&&(
-                            <button onClick={()=>toggleConfirm(ds)} title="약속 확정" style={{border:`1.5px solid ${isConfirmed(ds)?"rgba(255,255,255,0.15)":"#FF4D8D"}`,borderRadius:7,padding:"4px 8px",cursor:"pointer",fontSize:11,background:isConfirmed(ds)?"rgba(255,255,255,0.06)":"rgba(255,77,141,0.18)",color:isConfirmed(ds)?"var(--text-faint)":"#FF4D8D",fontWeight:700,transition:"all .18s"}}>
+                            <button onClick={()=>openConfirmModal(ds)} title="약속 확정" style={{border:`1.5px solid ${isConfirmed(ds)?"rgba(255,255,255,0.15)":"#FF4D8D"}`,borderRadius:7,padding:"4px 8px",cursor:"pointer",fontSize:11,background:isConfirmed(ds)?"rgba(255,255,255,0.06)":"rgba(255,77,141,0.18)",color:isConfirmed(ds)?"var(--text-faint)":"#FF4D8D",fontWeight:700,transition:"all .18s"}}>
                               {isConfirmed(ds)?"확정됨":"📌 확정"}
                             </button>
                           )}

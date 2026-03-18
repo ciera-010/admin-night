@@ -1,972 +1,730 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { doc, getDoc } from 'firebase/firestore';
-import { db } from '../config/firebase';
+import { useState, useEffect, useCallback, useRef } from "react";
 
-// 시스템 모듈 import
-import { buildSystemPrompt, estimateTokens } from '../systems';
-import { 
-  parseAIResponse, 
-  formatMetaInfo 
-} from '../systems';
-import {
-  INITIAL_GAME_STATE,
-  getExcitementLevel,
-  getRelationshipStage,
-  checkPacingViolation,
-  detectActionType,
-  extractEndingKeywords,
-  checkBranchPoint,
-  getStateSummary
-} from '../systems';
-import {
-  ENDING_STYLES,
-  checkEndingCondition,
-  getEndingData,
-  calculateEndingProgress,
-  generateEndingHint
-} from '../systems';
+const DAYS = ["월", "화", "수", "목", "금", "토", "일"];
+const DAYS_SHORT = ["일", "월", "화", "수", "목", "금", "토"];
+const MEMBERS = ["시은", "지수"];
+const M = {
+  시은: { accent: "#FF4D8D", bg: "#FFD6E7", text: "#8B1A4A" },
+  지수: { accent: "#9B59F5", bg: "#E8D5FF", text: "#3D1A6B" },
+};
+const WEEK_GOAL = 2;
+const STORAGE_KEY = "adminnite-v4";
 
-// 🆕 공이었수 전용 모듈
-import { getFormerTopDialogue, getFormerTopPsychologicalStage } from '../data/Dialoguepatterns.js';
-import { getSceneCalling } from '../data/sceneCallings.js';
-import { findSuType } from '../data/Charactertypes-complete.js';
-
-import './ChatInterface.css';
-
-function ChatInterface() {
-  const { storyId } = useParams();
-  const navigate = useNavigate();
-  
-  // 기본 state
-  const [story, setStory] = useState(null);
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [isLoadingStory, setIsLoadingStory] = useState(true);
-  const [backgroundImage, setBackgroundImage] = useState(null);
-  
-  // 게임 상태 (통합)
-  const [gameState, setGameState] = useState({
-    affectionGong: 0,
-    affectionSu: 0,
-    excitement: 0,
-    currentTurn: 1,
-    triggeredKeywords: [],
-    triggeredEvents: [],
-    badChoiceCount: 0,
-    currentScene: {
-      time: null,
-      location: null,
-      charAState: null,
-      charBState: null
-    }
+function getWeekKey(date) {
+  const d = new Date(date); d.setHours(0,0,0,0);
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  return new Date(d.setDate(diff)).toISOString().split("T")[0];
+}
+function getWeekDates(wk) {
+  const mon = new Date(wk);
+  return Array.from({length:7}, (_,i) => {
+    const d = new Date(mon); d.setDate(mon.getDate()+i);
+    return d.toISOString().split("T")[0];
   });
-  
-  // AdminPage 설정 (스토리에서 로드)
-  const [adminSettings, setAdminSettings] = useState({
-    excitementSettings: {},
-    eventKeywords: {},
-    balanceSettings: {}
-  });
-  
-  // 엔딩 관련
-  const [currentEnding, setCurrentEnding] = useState(null);
-  const [showEndingScreen, setShowEndingScreen] = useState(false);
-  const [endingHints, setEndingHints] = useState([]);
-  
-  // 분기점 알림
-  const [branchNotification, setBranchNotification] = useState(null);
-  
-  const messagesEndRef = useRef(null);
+}
+function fmt(ds) { const d = new Date(ds); return `${d.getMonth()+1}/${d.getDate()}`; }
+function fmtFull(ds) { const d = new Date(ds); return `${d.getMonth()+1}월 ${d.getDate()}일`; }
+function getDayLabel(ds) { return DAYS[new Date(ds).getDay() === 0 ? 6 : new Date(ds).getDay()-1]; }
+function getMonthDates(y, m) {
+  const first = new Date(y, m, 1);
+  const last  = new Date(y, m+1, 0);
+  const rows  = [];
+  for (let i = 0; i < first.getDay(); i++) {
+    const d = new Date(y, m, 1 - first.getDay() + i);
+    rows.push({ dateStr: d.toISOString().split("T")[0], cur: false });
+  }
+  for (let i = 1; i <= last.getDate(); i++) {
+    const d = new Date(y, m, i);
+    rows.push({ dateStr: d.toISOString().split("T")[0], cur: true });
+  }
+  while (rows.length % 7 !== 0) {
+    const d = new Date(y, m+1, rows.length - last.getDate() - first.getDay() + 1);
+    rows.push({ dateStr: d.toISOString().split("T")[0], cur: false });
+  }
+  return rows;
+}
 
-  // 편의를 위한 개별 값 추출
-  const { affectionGong, affectionSu, excitement, currentTurn, triggeredKeywords, badChoiceCount } = gameState;
-  const avgAffection = Math.floor((affectionGong + affectionSu) / 2);
+async function loadData() {
+  try {
+    const r = await window.storage.get(STORAGE_KEY, true);
+    return r?.value ? JSON.parse(r.value) : {};
+  } catch { return {}; }
+}
+async function persistData(d) {
+  try { await window.storage.set(STORAGE_KEY, JSON.stringify(d), true); return true; }
+  catch { return false; }
+}
 
-  // ============================================
-  // 유틸리티 함수
-  // ============================================
+export default function App() {
+  const todayStr = new Date().toISOString().split("T")[0];
+  const [tab, setTab]             = useState("week");
+  const [data, setDataRaw]        = useState({});
+  const [weekKey, setWeekKey]     = useState(getWeekKey(new Date()));
+  const [monthIdx, setMonthIdx]   = useState({ y: new Date().getFullYear(), m: new Date().getMonth() });
+  // 투표 로컬 상태 (저장 전 편집용)
+  const [localVotes, setLocalVotes] = useState(null); // null = 서버 데이터 사용
+  const [voteEditing, setVoteEditing] = useState(false);
+  // 완료 날 기록 팝업
+  const [completeDayModal, setCompleteDayModal] = useState(null); // dateStr
+  const [completeTodoInput, setCompleteTodoInput] = useState({ 시은:"", 지수:"" });
+  // 월간 날짜 상세 팝업
+  const [monthDetailDay, setMonthDetailDay] = useState(null);
+  const [todoInput, setTodoInput] = useState({ 시은:"", 지수:"" });
+  const [goalInput, setGoalInput] = useState({ 시은:"", 지수:"" });
+  const [confetti, setConfetti]   = useState(false);
+  const [sync, setSync]           = useState("idle");
+  const [lastSync, setLastSync]   = useState(null);
+  const isSaving   = useRef(false);
+  const lastSaveTs = useRef(0);
 
-  // 이미지 경로 처리
-  const getImageSrc = useCallback((imagePath) => {
-    if (!imagePath) return null;
-    if (imagePath.startsWith('http') || imagePath.startsWith('data:')) return imagePath;
-    
-    const publicUrl = process.env.PUBLIC_URL || '';
-    let cleanPath = imagePath;
-    
-    while (cleanPath.startsWith(publicUrl) && publicUrl) {
-      cleanPath = cleanPath.substring(publicUrl.length);
-    }
-    if (!cleanPath.startsWith('/')) cleanPath = '/' + cleanPath;
-    
-    return `${publicUrl}${cleanPath}`;
+  useEffect(() => {
+    loadData().then(d => { setDataRaw(d); setLastSync(new Date()); });
   }, []);
 
-  // 스크롤 자동 이동
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
-
   useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+    const t = setInterval(() => {
+      if (isSaving.current || Date.now() - lastSaveTs.current < 6000) return;
+      loadData().then(d => { setDataRaw(d); setLastSync(new Date()); });
+    }, 20000);
+    return () => clearInterval(t);
+  }, []);
 
-  // ============================================
-  // 스토리 로드
-  // ============================================
+  const save = useCallback(async (next) => {
+    isSaving.current = true;
+    setSync("saving");
+    const ok = await persistData(next);
+    lastSaveTs.current = Date.now();
+    isSaving.current = false;
+    setSync(ok ? "saved" : "error");
+    setLastSync(new Date());
+    setTimeout(() => setSync("idle"), 1800);
+  }, []);
 
-  const loadStory = useCallback(async () => {
-    console.log('🔍 Loading story for chat with ID:', storyId);
-    
-    try {
-      // 1. Firebase에서 먼저 찾기
-      const docRef = doc(db, 'stories', String(storyId));
-      const docSnap = await getDoc(docRef);
-      
-      if (docSnap.exists()) {
-        const foundStory = { id: docSnap.id, ...docSnap.data() };
-        console.log('✅ Story found in Firebase:', foundStory.title);
-        initializeStory(foundStory);
-        return;
-      }
-      
-      // 2. localStorage에서 찾기
-      const stories = JSON.parse(localStorage.getItem('kind_cat_stories') || '[]');
-      const foundStory = stories.find(s => String(s.id) === String(storyId));
-      
-      if (foundStory) {
-        console.log('✅ Story found in localStorage:', foundStory.title);
-        initializeStory(foundStory);
-        return;
-      }
-      
-      // 3. 못 찾음
-      console.error('❌ Story not found:', storyId);
-      setIsLoadingStory(false);
-      alert('스토리를 찾을 수 없습니다!');
-      navigate('/');
-      
-    } catch (error) {
-      console.error('❌ Error loading story:', error);
-      
-      // Firebase 에러 시 localStorage fallback
-      try {
-        const stories = JSON.parse(localStorage.getItem('kind_cat_stories') || '[]');
-        const foundStory = stories.find(s => String(s.id) === String(storyId));
-        
-        if (foundStory) {
-          console.log('✅ Fallback to localStorage:', foundStory.title);
-          initializeStory(foundStory);
-          return;
-        }
-      } catch (e) {
-        console.error('localStorage error:', e);
-      }
-      
-      setIsLoadingStory(false);
-      alert('스토리 로딩 중 오류가 발생했습니다.');
-      navigate('/');
-    }
-  }, [storyId, navigate]);
+  function setData(fn) {
+    setDataRaw(prev => { const next = fn(prev); save(next); return next; });
+  }
 
-  // 스토리 초기화
-  const initializeStory = (foundStory) => {
-    setStory(foundStory);
-    
-    // 게임 상태 초기화
-    setGameState({
-      ...INITIAL_GAME_STATE,
-      currentScene: {
-        time: foundStory.scenario?.time || null,
-        location: foundStory.scenario?.location || null,
-        charAState: null,
-        charBState: null
-      }
+  // ── week 데이터 ──
+  const weekDates = getWeekDates(weekKey);
+  const wd = data[weekKey] || {};
+
+  // 투표: localVotes 있으면 그거, 없으면 서버 데이터
+  const savedVotes  = wd.votes || {};
+  const activeVotes = localVotes || savedVotes;
+  const getVotes    = (ds) => activeVotes[ds] || [];
+  const getSavedVotes = (ds) => savedVotes[ds] || [];
+  const bothVotedSaved = (ds) => MEMBERS.every(m => getSavedVotes(ds).includes(m));
+  const confirmed   = wd.confirmed || [];
+  const isConfirmed = (ds) => confirmed.includes(ds);
+  const getCompleted = (ds) => { const wk = getWeekKey(ds); return (data[wk]?.completed||[]).includes(ds); };
+  const weekCompleted = wd.completed || [];
+  const doneCount   = weekCompleted.length;
+  const progress    = Math.min(doneCount / WEEK_GOAL, 1);
+  // 완료 날 기록된 할일
+  const getDayRecord = (ds) => { const wk = getWeekKey(ds); return data[wk]?.dayRecords?.[ds] || {}; };
+
+  // 투표 편집 시작
+  function startVoteEdit() {
+    setLocalVotes(JSON.parse(JSON.stringify(savedVotes)));
+    setVoteEditing(true);
+  }
+  function cancelVoteEdit() {
+    setLocalVotes(null);
+    setVoteEditing(false);
+  }
+  function toggleLocalVote(ds, member) {
+    if (!voteEditing) return;
+    setLocalVotes(prev => {
+      const cur = (prev[ds] || []);
+      const nv  = cur.includes(member) ? cur.filter(x=>x!==member) : [...cur, member];
+      return { ...prev, [ds]: nv };
     });
-    
-    // AdminPage 설정 로드
-    setAdminSettings({
-      excitementSettings: foundStory.excitementSettings || {},
-      eventKeywords: foundStory.eventKeywords || {},
-      balanceSettings: foundStory.balanceSettings || {}
+  }
+  function saveVotes() {
+    setData(prev => {
+      const w = prev[weekKey] || {};
+      return { ...prev, [weekKey]: { ...w, votes: localVotes } };
     });
-    
-    // 시작 메시지
-    setMessages([
-      {
-        role: 'system',
-        content: foundStory.scenario?.situation || '두 사람이 마주쳤다.',
-        type: 'narration'
-      }
-    ]);
-    
-    setIsLoadingStory(false);
-  };
+    setLocalVotes(null);
+    setVoteEditing(false);
+  }
 
-  useEffect(() => {
-    loadStory();
-  }, [loadStory]);
+  function toggleConfirm(ds) {
+    setData(prev => {
+      const w  = prev[weekKey] || {};
+      const c  = w.confirmed || [];
+      const nc = c.includes(ds) ? c.filter(x=>x!==ds) : [...c, ds];
+      return { ...prev, [weekKey]: { ...w, confirmed: nc } };
+    });
+  }
 
-  // ============================================
-  // 배경 이미지 업데이트
-  // ============================================
-
-  const updateBackgroundImage = useCallback((keyword = null) => {
-    if (!story) return;
-
-    // 1. 키워드 기반 이미지 (우선)
-    if (keyword && story.keywordImages) {
-      const keywordImage = story.keywordImages.find(ki => 
-        ki.keyword && keyword.toLowerCase().includes(ki.keyword.toLowerCase())
-      );
-      if (keywordImage?.image) {
-        console.log('🖼️ 키워드 배경 변경:', keyword);
-        setBackgroundImage(keywordImage.image);
-        return;
-      }
-    }
-
-    // 2. 호감도 기반 이미지
-    if (story.backgroundImages) {
-      let bgArray = [];
-      if (avgAffection <= 20) {
-        bgArray = story.backgroundImages[0] || story.backgroundImages['0'] || [];
-      } else if (avgAffection <= 40) {
-        bgArray = story.backgroundImages[20] || story.backgroundImages['20'] || [];
-      } else if (avgAffection <= 60) {
-        bgArray = story.backgroundImages[40] || story.backgroundImages['40'] || [];
-      } else if (avgAffection <= 80) {
-        bgArray = story.backgroundImages[60] || story.backgroundImages['60'] || [];
-      } else {
-        bgArray = story.backgroundImages[80] || story.backgroundImages['80'] || [];
-      }
-
-      if (bgArray.length > 0) {
-        const index = Math.floor((avgAffection % 20) / 20 * bgArray.length);
-        const selectedImage = bgArray[Math.min(index, bgArray.length - 1)];
-        setBackgroundImage(selectedImage);
-      }
-    }
-  }, [story, avgAffection]);
-
-  useEffect(() => {
-    if (story?.backgroundImages) {
-      updateBackgroundImage();
-    }
-  }, [avgAffection, story, updateBackgroundImage]);
-
-  // ============================================
-  // 키워드 & 페이싱 체크
-  // ============================================
-
-  // 사용자 입력에서 키워드 체크
-  const checkKeywordInInput = (text) => {
-    if (!story) return;
-    
-    // 배경 이미지 키워드 체크
-    if (story.keywordImages) {
-      for (const ki of story.keywordImages) {
-        if (ki.keyword && text.toLowerCase().includes(ki.keyword.toLowerCase())) {
-          updateBackgroundImage(ki.keyword);
-          break;
-        }
-      }
-    }
-    
-    // 엔딩 키워드 체크 (시스템 모듈 사용)
-    if (story.endings) {
-      const extracted = extractEndingKeywords(text, story.endings);
-      const newKeywords = [...triggeredKeywords];
-      
-      // 트루 엔딩 키워드
-      extracted.true.forEach(kw => {
-        const key = `true:${kw}`;
-        if (!newKeywords.includes(key)) {
-          newKeywords.push(key);
-        }
+  function toggleComplete(ds) {
+    const wk = getWeekKey(ds);
+    const isComp = getCompleted(ds);
+    if (!isComp) {
+      // 완료 처리 + 기록 모달 열기
+      setData(prev => {
+        const w  = prev[wk] || {};
+        const c  = w.completed || [];
+        return { ...prev, [wk]: { ...w, completed: [...c, ds] } };
       });
-      
-      // 히든 엔딩 키워드
-      extracted.hidden.forEach(kw => {
-        const key = `hidden:${kw}`;
-        if (!newKeywords.includes(key)) {
-          newKeywords.push(key);
-        }
-      });
-      
-      // 배드 엔딩 키워드 (즉시 배드)
-      if (extracted.bad.length > 0 && !newKeywords.includes('bad:triggered')) {
-        newKeywords.push('bad:triggered');
-      }
-      
-      if (newKeywords.length !== triggeredKeywords.length) {
-        setGameState(prev => ({
-          ...prev,
-          triggeredKeywords: newKeywords
-        }));
-      }
-    }
-  };
-
-  // 페이싱 체크 (급발진 방지)
-  const checkUserAction = (text) => {
-    const actionType = detectActionType(text);
-    if (actionType) {
-      const violation = checkPacingViolation(actionType, gameState);
-      if (violation.violation) {
-        console.log('⚠️ 페이싱 위반:', violation.message);
-        return violation;
-      }
-    }
-    return null;
-  };
-
-  // ============================================
-  // 엔딩 시스템
-  // ============================================
-
-  // 엔딩 판정 (시스템 모듈 사용)
-  const checkEnding = useCallback(() => {
-    if (!story?.endings) return null;
-    
-    const result = checkEndingCondition(gameState, story);
-    return result.canTrigger ? result.type : null;
-  }, [story, gameState]);
-
-  // 엔딩 트리거
-  const triggerEnding = () => {
-    const ending = checkEnding();
-    if (ending && story?.endings?.[ending]) {
-      setCurrentEnding(ending);
-      setShowEndingScreen(true);
+      setCompleteDayModal(ds);
+      setCompleteTodoInput({ 시은:"", 지수:"" });
+      setConfetti(true); setTimeout(() => setConfetti(false), 2400);
     } else {
-      // 엔딩 힌트 표시
-      const hints = generateEndingHint(gameState, story);
-      if (hints.length > 0) {
-        setEndingHints(hints);
-        setTimeout(() => setEndingHints([]), 5000);
-      }
+      setData(prev => {
+        const w  = prev[wk] || {};
+        const c  = w.completed || [];
+        return { ...prev, [wk]: { ...w, completed: c.filter(x=>x!==ds) } };
+      });
     }
-  };
+  }
 
-  // 엔딩 진행도 업데이트
-  useEffect(() => {
-    if (story?.endings) {
-      const progress = calculateEndingProgress(gameState, story);
-      console.log('📊 엔딩 진행도:', progress);
-    }
-  }, [gameState, story]);
-
-  // ============================================
-  // 게임 상태 업데이트
-  // ============================================
-
-  const updateGameState = (parsed) => {
-    const prevAvg = avgAffection;
-    
-    // 밸런스 설정에서 제한값 가져오기
-    const {
-      affectionGainMax = 15,
-      affectionLossMax = -10,
-      excitementGainMax = 15
-    } = adminSettings.balanceSettings || {};
-    
-    setGameState(prev => {
-      // AI 응답에서 변화량 추출
-      let gongChange = parsed.scores?.affectionGongChange || parsed.affection_gong_change || 0;
-      let suChange = parsed.scores?.affectionSuChange || parsed.affection_su_change || 0;
-      let excitementChange = parsed.scores?.excitementChange || parsed.excitement_change || 0;
-      
-      // 밸런스 설정에 따른 클램핑
-      gongChange = Math.max(affectionLossMax, Math.min(affectionGainMax, gongChange));
-      suChange = Math.max(affectionLossMax, Math.min(affectionGainMax, suChange));
-      excitementChange = Math.max(-20, Math.min(excitementGainMax, excitementChange));
-      
-      const newGong = Math.max(0, Math.min(100, prev.affectionGong + gongChange));
-      const newSu = Math.max(0, Math.min(100, prev.affectionSu + suChange));
-      const newExcitement = Math.max(0, Math.min(100, prev.excitement + excitementChange));
-      
-      // 혐오 행동 체크 (밸런스 설정 반영)
-      const badThreshold = adminSettings.balanceSettings?.badChoiceThreshold || -5;
-      let newBadCount = prev.badChoiceCount;
-      if (gongChange <= badThreshold || suChange <= badThreshold) {
-        newBadCount += 1;
-      }
-      
-      // 트리거된 키워드 업데이트
-      const newKeywords = [...prev.triggeredKeywords];
-      if (parsed.triggered_keywords) {
-        parsed.triggered_keywords.forEach(kw => {
-          if (!newKeywords.includes(kw)) {
-            newKeywords.push(kw);
-          }
-        });
-      }
-      
-      return {
-        ...prev,
-        affectionGong: newGong,
-        affectionSu: newSu,
-        excitement: newExcitement,
-        currentTurn: prev.currentTurn + 1,
-        badChoiceCount: newBadCount,
-        triggeredKeywords: newKeywords,
-        currentScene: parsed.meta ? {
-          time: parsed.meta.time || parsed.time || prev.currentScene.time,
-          location: parsed.meta.location || parsed.location || prev.currentScene.location,
-          charAState: parsed.meta.charAState || parsed.meta.char_a_state || parsed.char_a_state,
-          charBState: parsed.meta.charBState || parsed.meta.char_b_state || parsed.char_b_state
-        } : prev.currentScene
-      };
+  // 완료 날 할일 추가
+  function addDayRecord(ds, member) {
+    const text = completeTodoInput[member].trim(); if(!text) return;
+    const wk = getWeekKey(ds);
+    setData(prev => {
+      const w  = prev[wk] || {};
+      const dr = w.dayRecords || {};
+      const dayRec = dr[ds] || {};
+      const memberRec = dayRec[member] || [];
+      return { ...prev, [wk]: { ...w, dayRecords: { ...dr, [ds]: { ...dayRec, [member]: [...memberRec, { id: Date.now(), text }] } } } };
     });
-    
-    // 분기점 체크
-    const newAvg = Math.floor(
-      ((affectionGong + (parsed.scores?.affectionGongChange || parsed.affection_gong_change || 0)) + 
-       (affectionSu + (parsed.scores?.affectionSuChange || parsed.affection_su_change || 0))) / 2
-    );
-    const branchCheck = checkBranchPoint(prevAvg, newAvg);
-    if (branchCheck.reached) {
-      setBranchNotification(branchCheck.message);
-      setTimeout(() => setBranchNotification(null), 4000);
-    }
-    
-    // 이벤트 키워드 체크
-    checkEventKeywords(parsed);
-  };
-  
-  // 이벤트 키워드 체크 함수
-  const checkEventKeywords = (parsed) => {
-    const { eventKeywords = {} } = adminSettings;
-    const responseText = JSON.stringify(parsed).toLowerCase();
-    
-    // 분기점 키워드 체크
-    if (eventKeywords.branchPoints) {
-      eventKeywords.branchPoints.forEach(bp => {
-        if (bp.enabled !== false && responseText.includes(bp.keyword?.toLowerCase())) {
-          setBranchNotification(`🔀 ${bp.effect || '중요한 분기점에 도달했습니다!'}`);
-          setTimeout(() => setBranchNotification(null), 4000);
-        }
-      });
-    }
-    
-    // 특별 이벤트 키워드 체크
-    if (eventKeywords.specialEvents) {
-      eventKeywords.specialEvents.forEach(se => {
-        if (se.enabled !== false && responseText.includes(se.keyword?.toLowerCase())) {
-          setMessages(prev => [...prev, {
-            role: 'system',
-            content: `✨ ${se.effect || '특별한 이벤트가 발생했습니다!'}`,
-            type: 'event'
-          }]);
-        }
-      });
-    }
-  };
-
-  // ============================================
-  // AI 응답 처리
-  // ============================================
-
-  const processAIResponse = (aiResponse) => {
-    // 시스템 모듈의 파서 사용
-    const parsed = parseAIResponse(aiResponse);
-    
-    if (parsed.success) {
-      // 게임 상태 업데이트
-      updateGameState(parsed.isFallback ? { scores: {} } : parsed);
-
-      const newMessages = [];
-      const newExcitement = excitement + (parsed.scores?.excitementChange || parsed.excitement_change || 0);
-      const excitementInfo = getExcitementLevel(newExcitement);
-      const relationshipStage = getRelationshipStage(avgAffection);
-      
-      // AdminPage 흥분도 설정에서 레벨 이름 가져오기
-      const getExcitementLevelName = (level) => {
-        const settings = adminSettings.excitementSettings;
-        if (settings && settings[`level${level}`]) {
-          return settings[`level${level}`].name;
-        }
-        // 기본값
-        const defaultNames = ['', '평온', '은근한 긴장', '의식', '뚜렷한 욕망', '절정 직전', '완전한 흥분'];
-        return defaultNames[level] || `Lv.${level}`;
-      };
-
-      // 메타 정보 메시지
-      if (parsed.meta && (parsed.meta.time || parsed.meta.location)) {
-        const gongChange = parsed.scores?.affectionGongChange || parsed.raw?.affection_gong_change || parsed.affection_gong_change || 0;
-        const suChange = parsed.scores?.affectionSuChange || parsed.raw?.affection_su_change || parsed.affection_su_change || 0;
-        const excitementChange = parsed.scores?.excitementChange || parsed.raw?.excitement_change || parsed.excitement_change || 0;
-        
-        const metaContent = `━━━━━━━━━━━━━━━━━━━━
-⏰ ${parsed.meta.time || parsed.time || gameState.currentScene.time || '현재'}
-📍 ${parsed.meta.location || parsed.location || gameState.currentScene.location || '알 수 없음'}
-━━━━━━━━━━━━━━━━━━━━
-
-🔺 ${story.characterA?.name} (${story.characterA?.age}세)
-   ▫️ 상태: ${parsed.meta.charAState?.pose || parsed.char_a_state?.pose || '알 수 없음'}
-   ▫️ 복장: ${parsed.meta.charAState?.clothing || parsed.char_a_state?.clothing || '알 수 없음'}
-   ▫️ 호감도: ${affectionGong + gongChange}/100 (${gongChange >= 0 ? '+' : ''}${gongChange})
-
-🔻 ${story.characterB?.name} (${story.characterB?.age}세)
-   ▫️ 상태: ${parsed.meta.charBState?.pose || parsed.char_b_state?.pose || '알 수 없음'}
-   ▫️ 복장: ${parsed.meta.charBState?.clothing || parsed.char_b_state?.clothing || '알 수 없음'}
-   ▫️ 호감도: ${affectionSu + suChange}/100 (${suChange >= 0 ? '+' : ''}${suChange})
-
-💗 관계: ${relationshipStage.name}
-🔥 흥분: ${newExcitement}/100 - ${getExcitementLevelName(excitementInfo.level)} (${excitementChange >= 0 ? '+' : ''}${excitementChange})
-━━━━━━━━━━━━━━━━━━━━`;
-
-        newMessages.push({
-          role: 'assistant',
-          content: metaContent,
-          type: 'meta'
-        });
-      }
-
-      // 서술
-      if (parsed.narration) {
-        newMessages.push({ 
-          role: 'assistant', 
-          content: parsed.narration, 
-          type: 'narration' 
-        });
-      }
-
-      // 대사
-      if (parsed.dialogues && parsed.dialogues.length > 0) {
-        parsed.dialogues.forEach(d => {
-          if (d.speaker && d.text) {
-            newMessages.push({
-              role: 'assistant',
-              content: `${d.speaker}: "${d.text}"`,
-              type: 'dialogue',
-              character: d.speaker
-            });
-          }
-        });
-      }
-
-      // 선택지
-      const choices = parsed.choices || parsed.raw?.choices;
-      if (choices && Array.isArray(choices) && choices.length > 0) {
-        newMessages.push({
-          role: 'choices',
-          content: choices,
-          type: 'choices'
-        });
-      }
-
-      setMessages(prev => [...prev, ...newMessages]);
-
-    } else {
-      // 파싱 실패 시 원본 텍스트 표시
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: aiResponse,
-        type: 'text'
-      }]);
-    }
-  };
-
-  // ============================================
-  // 메시지 전송
-  // ============================================
-
-  const handleSend = async () => {
-    if (!input.trim() || isLoading || !story) return;
-
-    // 페이싱 체크
-    const pacingViolation = checkUserAction(input);
-    if (pacingViolation) {
-      setMessages(prev => [...prev, {
-        role: 'system',
-        content: `⚠️ ${pacingViolation.message}`,
-        type: 'warning'
-      }]);
-    }
-
-    const userMessage = { role: 'user', content: input, type: 'user' };
-    setMessages(prev => [...prev, userMessage]);
-    
-    // 키워드 체크
-    checkKeywordInInput(input);
-    
-    setInput('');
-    setIsLoading(true);
-
-    try {
-      const apiKey = localStorage.getItem('gemini_api_key');
-      if (!apiKey) {
-        alert('API 키가 없습니다!');
-        navigate(`/apikey/${storyId}`);
-        setIsLoading(false);
-        return;
-      }
-
-      // 시스템 프롬프트 생성 (모듈 사용 + AdminPage 설정 반영)
-      const systemPrompt = buildSystemPrompt(story, gameState, adminSettings);
-      
-      // 디버그 로그
-      console.log('📝 System prompt generated:', {
-        tokens: estimateTokens(systemPrompt),
-        hasExcitementSettings: !!adminSettings.excitementSettings,
-        hasEventKeywords: !!adminSettings.eventKeywords,
-        hasBalanceSettings: !!adminSettings.balanceSettings
-      });
-
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [
-              {
-                role: 'user',
-                parts: [{ text: systemPrompt + '\n\n사용자 선택: ' + input }]
-              }
-            ],
-            generationConfig: {
-              temperature: 0.9,
-              topK: 40,
-              topP: 0.95,
-              maxOutputTokens: 1024
-            }
-          })
-        }
-      );
-
-      // 429 에러 시 재시도
-      if (response.status === 429) {
-        setMessages(prev => [...prev, {
-          role: 'system',
-          content: '⏳ API 요청 한도 초과... 10초 후 자동 재시도합니다.',
-          type: 'info'
-        }]);
-        
-        await new Promise(resolve => setTimeout(resolve, 10000));
-        
-        const retryResponse = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ role: 'user', parts: [{ text: systemPrompt + '\n\n사용자 선택: ' + input }] }],
-              generationConfig: { temperature: 0.9, topK: 40, topP: 0.95, maxOutputTokens: 1024 }
-            })
-          }
-        );
-        
-        if (!retryResponse.ok) {
-          throw new Error(`재시도 실패: ${retryResponse.status}`);
-        }
-        
-        const retryData = await retryResponse.json();
-        if (retryData.candidates?.[0]?.content?.parts?.[0]?.text) {
-          processAIResponse(retryData.candidates[0].content.parts[0].text);
-        }
-        setIsLoading(false);
-        return;
-      }
-
-      if (!response.ok) {
-        throw new Error(`API 오류: ${response.status}`);
-      }
-
-      const data = await response.json();
-
-      if (!data.candidates || data.candidates.length === 0) {
-        throw new Error('AI 응답이 없습니다.');
-      }
-
-      const aiResponse = data.candidates[0].content.parts[0].text;
-      processAIResponse(aiResponse);
-
-    } catch (error) {
-      console.error('AI 응답 오류:', error);
-      setMessages(prev => [...prev, {
-        role: 'system',
-        content: `⚠️ 오류가 발생했습니다: ${error.message}`,
-        type: 'error'
-      }]);
-    }
-
-    setIsLoading(false);
-  };
-
-  const handleChoiceClick = (choice) => {
-    setInput(choice);
-  };
-
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
-  // 게임 재시작
-  const handleRestart = () => {
-    setShowEndingScreen(false);
-    setCurrentEnding(null);
-    setGameState({
-      ...INITIAL_GAME_STATE,
-      currentScene: {
-        time: story?.scenario?.time || null,
-        location: story?.scenario?.location || null,
-        charAState: null,
-        charBState: null
-      }
+    setCompleteTodoInput(p => ({ ...p, [member]: "" }));
+  }
+  function delDayRecord(ds, member, id) {
+    const wk = getWeekKey(ds);
+    setData(prev => {
+      const w  = prev[wk] || {};
+      const dr = w.dayRecords || {};
+      const dayRec = dr[ds] || {};
+      return { ...prev, [wk]: { ...w, dayRecords: { ...dr, [ds]: { ...dayRec, [member]: (dayRec[member]||[]).filter(x=>x.id!==id) } } } };
     });
-    setMessages([{
-      role: 'system',
-      content: story?.scenario?.situation || '두 사람이 마주쳤다.',
-      type: 'narration'
-    }]);
-  };
-
-  // ============================================
-  // 렌더링
-  // ============================================
-
-  // 로딩 중
-  if (isLoadingStory) {
-    return (
-      <div className="chat-interface">
-        <div className="loading">
-          <div className="loading-spinner"></div>
-          <p>스토리를 불러오는 중...</p>
-        </div>
-      </div>
-    );
   }
 
-  // 스토리 없음
-  if (!story) {
-    return (
-      <div className="chat-interface">
-        <div className="error-container">
-          <h2>⚠️ 스토리를 찾을 수 없습니다</h2>
-          <p>스토리 ID: {storyId}</p>
-          <button className="btn-back" onClick={() => navigate('/')}>
-            홈으로 돌아가기
-          </button>
-        </div>
-      </div>
-    );
+  // ── month ──
+  const monthDates = getMonthDates(monthIdx.y, monthIdx.m);
+  function isDateConfirmed(ds) { return (data[getWeekKey(ds)]?.confirmed||[]).includes(ds); }
+  function getDateVotes(ds)    { return data[getWeekKey(ds)]?.votes?.[ds] || []; }
+  function prevMonth() { setMonthIdx(p => p.m===0?{y:p.y-1,m:11}:{y:p.y,m:p.m-1}); }
+  function nextMonth() { setMonthIdx(p => p.m===11?{y:p.y+1,m:0}:{y:p.y,m:p.m+1}); }
+
+  // ── todos ──
+  function addTodo(member) {
+    const text = todoInput[member].trim(); if(!text) return;
+    setData(prev => {
+      const w = prev[weekKey]||{}; const t = w.todos||{};
+      return {...prev,[weekKey]:{...w,todos:{...t,[member]:[...(t[member]||[]),{id:Date.now(),text,done:false}]}}};
+    });
+    setTodoInput(p=>({...p,[member]:""}));
+  }
+  function toggleTodo(member,id) {
+    setData(prev=>{
+      const w=prev[weekKey]||{};const t=w.todos||{};
+      return{...prev,[weekKey]:{...w,todos:{...t,[member]:(t[member]||[]).map(x=>x.id===id?{...x,done:!x.done}:x)}}};
+    });
+  }
+  function delTodo(member,id) {
+    setData(prev=>{
+      const w=prev[weekKey]||{};const t=w.todos||{};
+      return{...prev,[weekKey]:{...w,todos:{...t,[member]:(t[member]||[]).filter(x=>x.id!==id)}}};
+    });
+  }
+  function addGoal(member) {
+    const text=goalInput[member].trim();if(!text)return;
+    setData(prev=>{const g=prev._goals||{};return{...prev,_goals:{...g,[member]:[...(g[member]||[]),{id:Date.now(),text}]}};});
+    setGoalInput(p=>({...p,[member]:""}));
+  }
+  function delGoal(member,id) {
+    setData(prev=>{const g=prev._goals||{};return{...prev,_goals:{...g,[member]:(g[member]||[]).filter(x=>x.id!==id)}};});
   }
 
-  // 엔딩 화면
-  if (showEndingScreen && currentEnding && story?.endings?.[currentEnding]) {
-    const endingData = getEndingData(currentEnding, story);
-    const style = ENDING_STYLES[currentEnding] || ENDING_STYLES.normal;
+  const allWks     = Object.keys(data).filter(k=>k!=="_goals");
+  const totalDone  = allWks.reduce((a,wk)=>a+(data[wk]?.completed||[]).length,0);
+  const goalMetWks = allWks.filter(wk=>(data[wk]?.completed||[]).length>=WEEK_GOAL).length;
+  const MONTH_NAMES=["1월","2월","3월","4월","5월","6월","7월","8월","9월","10월","11월","12월"];
+  const syncColor = sync==="saved"?"#FFD84D":sync==="saving"?"rgba(255,216,77,0.5)":sync==="error"?"#F87171":"#444";
+  const syncLabel = sync==="saved"?"✓ 저장됨":sync==="saving"?"저장 중...":sync==="error"?"오류":lastSync?`${lastSync.getHours()}:${String(lastSync.getMinutes()).padStart(2,"0")} 동기화`:"대기중";
 
-    return (
-      <div className="ending-screen">
-        {endingData.cgImage && (
-          <div 
-            className="ending-bg"
-            style={{ backgroundImage: `url(${getImageSrc(endingData.cgImage)})` }}
-          />
-        )}
-        <div className="ending-overlay" style={{ background: style.bg }} />
-        
-        <div className="ending-content">
-          <span className="ending-icon-large">{style.icon}</span>
-          <h1 className="ending-label">{style.label}</h1>
-          <h2 className="ending-name">{endingData.name}</h2>
-          
-          <div className="ending-description">
-            <p>{endingData.description}</p>
-          </div>
-          
-          {endingData.reward && currentEnding === 'true' && (
-            <div className="ending-reward">
-              <span>🎁</span> {endingData.reward}
-            </div>
-          )}
-          
-          <div className="ending-stats">
-            <div className="ending-stat">
-              <span className="ending-stat-label">{story.characterA?.name}</span>
-              <span className="ending-stat-value">{affectionGong}%</span>
-            </div>
-            <div className="ending-stat">
-              <span className="ending-stat-label">{story.characterB?.name}</span>
-              <span className="ending-stat-value">{affectionSu}%</span>
-            </div>
-          </div>
-          
-          <div className="ending-actions">
-            <button className="btn-restart" onClick={handleRestart}>
-              🔄 처음부터 다시하기
-            </button>
-            <button className="btn-home" onClick={() => navigate('/')}>
-              🏠 홈으로
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // 메인 UI
-  const excitementInfo = getExcitementLevel(excitement);
-  const relationshipStage = getRelationshipStage(avgAffection);
+  function prevWeek(){const d=new Date(weekKey);d.setDate(d.getDate()-7);setWeekKey(getWeekKey(d));}
+  function nextWeek(){const d=new Date(weekKey);d.setDate(d.getDate()+7);setWeekKey(getWeekKey(d));}
 
   return (
-    <div 
-      className="chat-interface"
-      style={{
-        backgroundImage: backgroundImage ? `url(${getImageSrc(backgroundImage)})` : 'none'
-      }}
-    >
-      {/* 분기점 알림 */}
-      {branchNotification && (
-        <div className="branch-notification">
-          {branchNotification}
-        </div>
-      )}
-      
-      {/* 엔딩 힌트 */}
-      {endingHints.length > 0 && (
-        <div className="ending-hints">
-          {endingHints.map((hint, i) => (
-            <div key={i} className="ending-hint">{hint}</div>
+    <div style={{minHeight:"100vh",background:"var(--bg)",color:"var(--text)"}}>
+
+      {/* confetti */}
+      {confetti&&(
+        <div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:9999,overflow:"hidden"}}>
+          {Array.from({length:40}).map((_,i)=>(
+            <div key={i} style={{position:"absolute",left:`${Math.random()*100}%`,top:"-10px",width:7,height:7,borderRadius:Math.random()>.5?"50%":"2px",background:["#FFD84D","#FF4D8D","#9B59F5","#4ADE80","#fff"][i%5],animation:`cffall ${.7+Math.random()*.9}s ${Math.random()*.5}s linear forwards`}}/>
           ))}
         </div>
       )}
 
-      {/* 헤더 */}
-      <div className="chat-header">
-        <button className="btn-back" onClick={() => navigate('/')}>
-          ← 홈
-        </button>
-        
-        <div className="header-logo" onClick={() => navigate('/')} style={{ cursor: 'pointer' }}>
-          <img 
-            src={`${process.env.PUBLIC_URL}/cat-icon.png`}
-            alt="CAT" 
-            className="header-cat-icon"
-            onError={(e) => e.target.style.display = 'none'}
-          />
-        </div>
-        
-        <div className="header-stats">
-          {/* 공 호감도 */}
-          <div className="stat-item gong">
-            <div className="stat-top">
-              <span className="stat-label">{story.characterA?.name || '공'}</span>
-              <span className="stat-state">{relationshipStage.name}</span>
+      {/* ── 완료 기록 모달 ── */}
+      {completeDayModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:500,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+          <div style={{background:"var(--surface)",borderRadius:18,padding:20,width:"100%",maxWidth:420,border:"1px solid var(--border)"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+              <div>
+                <div style={{fontSize:15,fontWeight:900}}>🌙 어드민나잇 완료!</div>
+                <div style={{fontSize:11,color:"var(--text-muted)",marginTop:2}}>{fmtFull(completeDayModal)} ({getDayLabel(completeDayModal)}) — 오늘 한 일을 기록해봐</div>
+              </div>
+              <button onClick={()=>setCompleteDayModal(null)} style={{background:"none",border:"none",color:"var(--text-faint)",fontSize:20,cursor:"pointer"}}>×</button>
             </div>
-            <div className="stat-bar">
-              <div className="stat-fill gong" style={{ width: `${affectionGong}%` }} />
-            </div>
-            <span className="stat-value">{affectionGong}%</span>
-          </div>
-          
-          {/* 수 호감도 */}
-          <div className="stat-item su">
-            <div className="stat-top">
-              <span className="stat-label">{story.characterB?.name || '수'}</span>
-              <span className="stat-state">{relationshipStage.name}</span>
-            </div>
-            <div className="stat-bar">
-              <div className="stat-fill su" style={{ width: `${affectionSu}%` }} />
-            </div>
-            <span className="stat-value">{affectionSu}%</span>
-          </div>
-          
-          {/* 흥분도 */}
-          <div className="stat-item excitement">
-            <div className="stat-top">
-              <span className="stat-label">💓</span>
-              <span className="stat-state">Lv.{excitementInfo.level}</span>
-            </div>
-            <div className="stat-bar">
-              <div className="stat-fill excitement" style={{ width: `${excitement}%` }} />
-            </div>
-            <span className="stat-value">{excitement}%</span>
-          </div>
-          
-          {/* 턴 카운터 */}
-          <div className="stat-item turn">
-            <span className="stat-label">턴</span>
-            <span className="stat-value">{currentTurn}</span>
+            {MEMBERS.map(mb=>{
+              const c=M[mb];
+              const records=getDayRecord(completeDayModal)[mb]||[];
+              return(
+                <div key={mb} style={{marginBottom:12}}>
+                  <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+                    <div style={{width:7,height:7,borderRadius:"50%",background:c.accent}}/>
+                    <span style={{fontSize:12,fontWeight:700,color:c.accent}}>{mb}의 오늘 한 일</span>
+                  </div>
+                  <div style={{display:"flex",gap:6,marginBottom:6}}>
+                    <input value={completeTodoInput[mb]} onChange={e=>setCompleteTodoInput(p=>({...p,[mb]:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&addDayRecord(completeDayModal,mb)} placeholder="오늘 한 일 추가..." style={{flex:1,background:"rgba(255,255,255,0.05)",border:`1px solid ${c.accent}35`,borderRadius:9,padding:"8px 11px",color:"var(--text)",fontSize:12,outline:"none"}}/>
+                    <button onClick={()=>addDayRecord(completeDayModal,mb)} style={{background:c.accent,border:"none",borderRadius:9,padding:"8px 13px",cursor:"pointer",color:"#fff",fontSize:15,fontWeight:700}}>+</button>
+                  </div>
+                  {records.map(r=>(
+                    <div key={r.id} style={{display:"flex",alignItems:"center",gap:7,padding:"5px 8px",background:"rgba(255,255,255,0.03)",borderRadius:7,marginBottom:4}}>
+                      <span style={{fontSize:10,color:c.accent}}>✦</span>
+                      <span style={{flex:1,fontSize:11}}>{r.text}</span>
+                      <button onClick={()=>delDayRecord(completeDayModal,mb,r.id)} style={{background:"none",border:"none",color:"var(--text-faint)",cursor:"pointer",fontSize:13}}>×</button>
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+            <button onClick={()=>setCompleteDayModal(null)} style={{width:"100%",background:"var(--yellow)",border:"none",borderRadius:11,padding:"11px 0",fontSize:13,fontWeight:900,color:"#0E0E16",cursor:"pointer",marginTop:4}}>저장하고 닫기</button>
           </div>
         </div>
-      </div>
+      )}
 
-      {/* 메시지 컨테이너 */}
-      <div className="messages-container">
-        {messages.map((msg, idx) => {
-          if (msg.type === 'choices') {
-            return (
-              <div key={idx} className="choices-container">
-                {msg.content.map((choice, i) => (
-                  <button
-                    key={i}
-                    className="choice-btn"
-                    onClick={() => handleChoiceClick(choice)}
-                  >
-                    {choice}
-                  </button>
+      {/* ── 월간 날짜 상세 모달 ── */}
+      {monthDetailDay && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:500,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+          <div style={{background:"var(--surface)",borderRadius:18,padding:20,width:"100%",maxWidth:420,border:"1px solid var(--border)"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+              <div>
+                <div style={{fontSize:15,fontWeight:900}}>{getCompleted(monthDetailDay)?"✅":"📌"} {fmtFull(monthDetailDay)}</div>
+                <div style={{fontSize:11,color:"var(--text-muted)",marginTop:2}}>{getDayLabel(monthDetailDay)}요일</div>
+              </div>
+              <button onClick={()=>setMonthDetailDay(null)} style={{background:"none",border:"none",color:"var(--text-faint)",fontSize:20,cursor:"pointer"}}>×</button>
+            </div>
+            {getCompleted(monthDetailDay) ? (
+              <>
+                <div style={{fontSize:11,fontWeight:700,color:"var(--green)",marginBottom:10}}>🌙 이날 어드민나잇에서 한 일</div>
+                {MEMBERS.map(mb=>{
+                  const c=M[mb];
+                  const records=getDayRecord(monthDetailDay)[mb]||[];
+                  return(
+                    <div key={mb} style={{marginBottom:12}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+                        <div style={{width:7,height:7,borderRadius:"50%",background:c.accent}}/>
+                        <span style={{fontSize:12,fontWeight:700,color:c.accent}}>{mb}</span>
+                      </div>
+                      {records.length===0
+                        ?<div style={{fontSize:10,color:"var(--text-faint)",paddingLeft:13}}>기록 없음</div>
+                        :records.map(r=>(
+                          <div key={r.id} style={{display:"flex",alignItems:"center",gap:7,padding:"5px 8px",background:`rgba(${mb==="시은"?"255,77,141":"155,89,245"},0.06)`,borderRadius:7,marginBottom:4}}>
+                            <span style={{fontSize:10,color:c.accent}}>✦</span>
+                            <span style={{flex:1,fontSize:11}}>{r.text}</span>
+                            <button onClick={()=>delDayRecord(monthDetailDay,mb,r.id)} style={{background:"none",border:"none",color:"var(--text-faint)",cursor:"pointer",fontSize:13}}>×</button>
+                          </div>
+                        ))
+                      }
+                      {/* 추가도 가능 */}
+                      <div style={{display:"flex",gap:5,marginTop:4}}>
+                        <input value={completeTodoInput[mb]} onChange={e=>setCompleteTodoInput(p=>({...p,[mb]:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&addDayRecord(monthDetailDay,mb)} placeholder="추가하기..." style={{flex:1,background:"rgba(255,255,255,0.04)",border:`1px solid ${c.accent}28`,borderRadius:7,padding:"5px 8px",color:"var(--text)",fontSize:10,outline:"none"}}/>
+                        <button onClick={()=>addDayRecord(monthDetailDay,mb)} style={{background:c.accent,border:"none",borderRadius:7,padding:"5px 9px",cursor:"pointer",color:"#fff",fontSize:11,fontWeight:700}}>+</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </>
+            ) : (
+              <div style={{fontSize:11,color:"var(--text-muted)",textAlign:"center",padding:"20px 0"}}>
+                {isDateConfirmed(monthDetailDay)?"📌 약속 확정된 날이야!":"아직 완료되지 않은 날이야"}
+              </div>
+            )}
+            <button onClick={()=>{setMonthDetailDay(null);setCompleteTodoInput({시은:"",지수:""}); }} style={{width:"100%",background:"var(--surface2)",border:"none",borderRadius:11,padding:"10px 0",fontSize:12,fontWeight:700,color:"var(--text)",cursor:"pointer",marginTop:4}}>닫기</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── HEADER ── */}
+      <header style={{background:"var(--surface)",borderBottom:"1px solid var(--border)",padding:"18px 16px 14px",position:"sticky",top:0,zIndex:100}}>
+        <div style={{maxWidth:500,margin:"0 auto"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+            <span style={{fontSize:22}}>🌙</span>
+            <div>
+              <div style={{fontSize:17,fontWeight:900,letterSpacing:"-0.5px"}}>어드민나잇</div>
+              <div style={{fontSize:9,color:"var(--text-muted)",letterSpacing:"1px"}}>ADMIN NIGHT</div>
+            </div>
+            <div style={{marginLeft:"auto",textAlign:"right"}}>
+              <div style={{fontSize:9,color:syncColor,marginBottom:2}}>{syncLabel}</div>
+              <div style={{fontSize:18,fontWeight:900,color:"var(--yellow)"}}>{totalDone}<span style={{fontSize:10,color:"var(--text-muted)",marginLeft:3,fontWeight:400}}>총 완료</span></div>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:7,marginBottom:12}}>
+            {[
+              {label:"이번주",value:`${doneCount}/${WEEK_GOAL}`,color:doneCount>=WEEK_GOAL?"var(--green)":"var(--yellow)"},
+              {label:"목표달성",value:`${goalMetWks}주`,color:"var(--yellow)"},
+              {label:"총세션",value:`${totalDone}회`,color:"var(--yellow)"},
+            ].map(s=>(
+              <div key={s.label} style={{flex:1,background:"var(--surface2)",borderRadius:9,padding:"7px 8px",textAlign:"center"}}>
+                <div style={{fontSize:15,fontWeight:900,color:s.color}}>{s.value}</div>
+                <div style={{fontSize:9,color:"var(--text-faint)",marginTop:1}}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:3,background:"var(--surface2)",borderRadius:11,padding:3}}>
+            {[["week","📅 주간"],["month","🗓 월간"],["todos","📝 할 일"]].map(([id,label])=>(
+              <button key={id} onClick={()=>setTab(id)} style={{flex:1,border:"none",borderRadius:8,padding:"7px 0",cursor:"pointer",fontSize:11,fontWeight:700,transition:"all .2s",background:tab===id?"var(--yellow)":"transparent",color:tab===id?"#0E0E16":"var(--text-faint)"}}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </header>
+
+      <main style={{maxWidth:500,margin:"0 auto",padding:"14px 14px 48px"}}>
+
+        {/* ════ WEEK ════ */}
+        {tab==="week" && (
+          <>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+              <button onClick={prevWeek} style={{background:"var(--surface2)",border:"none",color:"var(--text)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:14}}>‹</button>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:13,fontWeight:700}}>{fmt(weekDates[0])} – {fmt(weekDates[6])}</div>
+                {weekKey===getWeekKey(new Date())&&<div style={{fontSize:9,color:"var(--yellow)",marginTop:1}}>이번 주</div>}
+              </div>
+              <button onClick={nextWeek} style={{background:"var(--surface2)",border:"none",color:"var(--text)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:14}}>›</button>
+            </div>
+
+            {/* progress */}
+            <div style={{marginBottom:12}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+                <span style={{fontSize:10,color:"var(--text-muted)"}}>이번 주 진행도</span>
+                <span style={{fontSize:10,fontWeight:700,color:doneCount>=WEEK_GOAL?"var(--green)":"var(--yellow)"}}>{doneCount>=WEEK_GOAL?"🎉 목표 달성!":`${doneCount}/${WEEK_GOAL}회`}</span>
+              </div>
+              <div style={{height:5,background:"var(--surface2)",borderRadius:999}}>
+                <div style={{height:"100%",borderRadius:999,transition:"width .5s",width:`${progress*100}%`,background:doneCount>=WEEK_GOAL?"var(--green)":"var(--yellow)"}}/>
+              </div>
+            </div>
+
+            {/* 흐름 안내 */}
+            <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,marginBottom:12,padding:"7px 12px",background:"var(--surface2)",borderRadius:10}}>
+              {[["1","투표 후 저장","var(--yellow)"],["→"],["2","약속확정 📌","#FF4D8D"],["→"],["3","완료+기록 ✅","var(--green)"]].map((item,i)=>(
+                item[0]==="→"
+                  ?<span key={i} style={{fontSize:10,color:"var(--text-faint)"}}>→</span>
+                  :<div key={item[0]} style={{display:"flex",alignItems:"center",gap:4}}>
+                    <div style={{width:15,height:15,borderRadius:"50%",background:item[2],display:"flex",alignItems:"center",justifyContent:"center",fontSize:8,fontWeight:900,color:"#0E0E16"}}>{item[0]}</div>
+                    <span style={{fontSize:9,color:"var(--text-muted)",whiteSpace:"nowrap"}}>{item[1]}</span>
+                  </div>
+              ))}
+            </div>
+
+            {/* 투표 섹션 */}
+            <div style={{background:"var(--surface2)",borderRadius:13,padding:12,marginBottom:10,border:`1px solid ${voteEditing?"var(--yellow-border)":"var(--border)"}`}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                <span style={{fontSize:12,fontWeight:700,color:voteEditing?"var(--yellow)":"var(--text-muted)"}}>
+                  {voteEditing?"✏️ 가능한 날 선택 중...":"📋 가능한 날 투표"}
+                </span>
+                {!voteEditing
+                  ?<button onClick={startVoteEdit} style={{background:"var(--yellow-dim)",border:"1px solid var(--yellow-border)",borderRadius:8,padding:"5px 12px",cursor:"pointer",color:"var(--yellow)",fontSize:11,fontWeight:700}}>수정하기</button>
+                  :<div style={{display:"flex",gap:6}}>
+                    <button onClick={cancelVoteEdit} style={{background:"rgba(255,255,255,0.05)",border:"1px solid var(--border)",borderRadius:8,padding:"5px 10px",cursor:"pointer",color:"var(--text-muted)",fontSize:11}}>취소</button>
+                    <button onClick={saveVotes} style={{background:"var(--yellow)",border:"none",borderRadius:8,padding:"5px 12px",cursor:"pointer",color:"#0E0E16",fontSize:11,fontWeight:900}}>저장</button>
+                  </div>
+                }
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                {weekDates.map((ds,i)=>{
+                  const v=getVotes(ds);
+                  const savedV=getSavedVotes(ds);
+                  const isToday=ds===todayStr;
+                  return(
+                    <div key={ds} style={{display:"flex",alignItems:"center",gap:8}}>
+                      <div style={{minWidth:52,display:"flex",alignItems:"center",gap:4}}>
+                        <span style={{fontSize:10,color:i>=5?"#FF6B6B":"var(--text-faint)",width:14}}>{DAYS[i]}</span>
+                        <span style={{fontSize:13,fontWeight:700,color:isToday?"var(--yellow)":"var(--text)"}}>{fmt(ds)}</span>
+                      </div>
+                      <div style={{display:"flex",gap:5,flex:1}}>
+                        {MEMBERS.map(mb=>{
+                          const c=M[mb];
+                          const voted=v.includes(mb);
+                          const savedVoted=savedV.includes(mb);
+                          const changed=voted!==savedVoted&&voteEditing;
+                          return(
+                            <button key={mb}
+                              onClick={()=>voteEditing&&toggleLocalVote(ds,mb)}
+                              style={{flex:1,border:`1.5px solid ${voted?c.accent:changed?"rgba(255,216,77,0.3)":"rgba(255,255,255,0.07)"}`,borderRadius:8,padding:"5px 6px",cursor:voteEditing?"pointer":"default",fontSize:10,fontWeight:700,transition:"all .15s",background:voted?c.bg:"transparent",color:voted?c.text:"var(--text-faint)",opacity:voteEditing||voted?1:0.7}}>
+                              {voted?"✓":"○"} {mb}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {/* 확정/완료 버튼 (저장된 투표 기준) */}
+                      {!voteEditing&&(
+                        <div style={{display:"flex",gap:4}}>
+                          {bothVotedSaved(ds)&&(
+                            <button onClick={()=>toggleConfirm(ds)} title="약속 확정" style={{border:`1.5px solid ${isConfirmed(ds)?"rgba(255,255,255,0.15)":"#FF4D8D"}`,borderRadius:7,padding:"4px 8px",cursor:"pointer",fontSize:11,background:isConfirmed(ds)?"rgba(255,255,255,0.06)":"rgba(255,77,141,0.18)",color:isConfirmed(ds)?"var(--text-faint)":"#FF4D8D",fontWeight:700,transition:"all .18s"}}>
+                              {isConfirmed(ds)?"확정됨":"📌 확정"}
+                            </button>
+                          )}
+                          {isConfirmed(ds)&&(
+                            <button onClick={()=>toggleComplete(ds)} title="완료!" style={{border:`1.5px solid ${getCompleted(ds)?"var(--green)":"rgba(74,222,128,0.3)"}`,borderRadius:7,padding:"4px 8px",cursor:"pointer",fontSize:12,background:getCompleted(ds)?"var(--green-dim)":"transparent",color:getCompleted(ds)?"var(--green)":"rgba(74,222,128,0.4)"}}>
+                              {getCompleted(ds)?"✅":"🔲"}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 이번 주 요약 */}
+            {(confirmed.length>0||weekCompleted.length>0)&&!voteEditing&&(
+              <div style={{display:"flex",flexDirection:"column",gap:7}}>
+                {confirmed.length>0&&(
+                  <div style={{background:"rgba(255,77,141,0.07)",border:"1px solid rgba(255,77,141,0.2)",borderRadius:11,padding:12}}>
+                    <div style={{fontSize:10,fontWeight:700,color:"#FF4D8D",marginBottom:5}}>📌 이번 주 확정된 약속</div>
+                    <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                      {confirmed.map(d=>(
+                        <span key={d} style={{fontSize:10,padding:"3px 8px",background:"rgba(255,77,141,0.1)",borderRadius:999,color:"var(--text)"}}>
+                          {DAYS[weekDates.indexOf(d)]} {fmt(d)} {getCompleted(d)?"✅":""}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {weekCompleted.length>0&&(
+                  <div style={{background:"var(--green-dim)",border:"1px solid var(--green-border)",borderRadius:11,padding:12}}>
+                    <div style={{fontSize:10,fontWeight:700,color:"var(--green)",marginBottom:6}}>✅ 이번 주 완료한 어드민나잇</div>
+                    {weekCompleted.map(d=>{
+                      const rec=getDayRecord(d);
+                      return(
+                        <div key={d} style={{marginBottom:8}}>
+                          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                            <span style={{fontSize:11,fontWeight:700}}>{getDayLabel(d)} {fmt(d)} 🌙</span>
+                            <button onClick={()=>{setCompleteDayModal(d);setCompleteTodoInput({시은:"",지수:""}); }} style={{background:"rgba(74,222,128,0.12)",border:"1px solid var(--green-border)",borderRadius:7,padding:"3px 8px",cursor:"pointer",color:"var(--green)",fontSize:9,fontWeight:700}}>+ 기록추가</button>
+                          </div>
+                          {MEMBERS.map(mb=>{
+                            const c=M[mb];
+                            const items=rec[mb]||[];
+                            if(!items.length) return null;
+                            return(
+                              <div key={mb} style={{marginTop:4,paddingLeft:8}}>
+                                <span style={{fontSize:9,color:c.accent,fontWeight:700}}>{mb}: </span>
+                                {items.map(r=><span key={r.id} style={{fontSize:9,color:"var(--text-muted)",marginRight:6}}>✦{r.text}</span>)}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ════ MONTH ════ */}
+        {tab==="month"&&(
+          <>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+              <button onClick={prevMonth} style={{background:"var(--surface2)",border:"none",color:"var(--text)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:14}}>‹</button>
+              <div style={{fontSize:14,fontWeight:900}}>{monthIdx.y}년 {MONTH_NAMES[monthIdx.m]}</div>
+              <button onClick={nextMonth} style={{background:"var(--surface2)",border:"none",color:"var(--text)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:14}}>›</button>
+            </div>
+
+            {/* 목표 */}
+            <div style={{display:"flex",gap:8,marginBottom:14}}>
+              {MEMBERS.map(mb=>{
+                const c=M[mb];const goals=(data._goals||{})[mb]||[];
+                return(
+                  <div key={mb} style={{flex:1,background:"var(--surface2)",borderRadius:12,padding:12,border:`1px solid ${c.accent}20`}}>
+                    <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:8}}>
+                      <div style={{width:7,height:7,borderRadius:"50%",background:c.accent}}/>
+                      <span style={{fontSize:11,fontWeight:700}}>{mb}의 목표</span>
+                    </div>
+                    <div style={{display:"flex",gap:5,marginBottom:7}}>
+                      <input value={goalInput[mb]} onChange={e=>setGoalInput(p=>({...p,[mb]:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&addGoal(mb)} placeholder="목표 추가" style={{flex:1,background:"rgba(255,255,255,0.05)",border:`1px solid ${c.accent}28`,borderRadius:7,padding:"5px 8px",color:"var(--text)",fontSize:10,outline:"none"}}/>
+                      <button onClick={()=>addGoal(mb)} style={{background:c.accent,border:"none",borderRadius:7,padding:"5px 9px",cursor:"pointer",color:"#fff",fontSize:12,fontWeight:700}}>+</button>
+                    </div>
+                    {goals.length===0
+                      ?<div style={{fontSize:10,color:"var(--text-faint)",textAlign:"center",padding:"4px 0"}}>목표를 추가해봐!</div>
+                      :<div style={{display:"flex",flexDirection:"column",gap:4}}>
+                        {goals.map(g=>(
+                          <div key={g.id} style={{display:"flex",alignItems:"center",gap:5,padding:"4px 6px",background:"rgba(255,255,255,0.03)",borderRadius:6}}>
+                            <span style={{fontSize:9,color:c.accent}}>✦</span>
+                            <span style={{flex:1,fontSize:10,color:"var(--text)"}}>{g.text}</span>
+                            <button onClick={()=>delGoal(mb,g.id)} style={{background:"none",border:"none",color:"var(--text-faint)",cursor:"pointer",fontSize:12}}>×</button>
+                          </div>
+                        ))}
+                      </div>
+                    }
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* 캘린더 그리드 */}
+            <div style={{background:"var(--surface2)",borderRadius:13,padding:11,border:"1px solid var(--border)"}}>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",marginBottom:5}}>
+                {DAYS_SHORT.map((d,i)=>(
+                  <div key={d} style={{textAlign:"center",fontSize:9,fontWeight:700,color:i===0?"#FF6B6B":i===6?"#6B8BFF":"var(--text-faint)",padding:"3px 0"}}>{d}</div>
                 ))}
               </div>
-            );
-          }
+              <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3}}>
+                {monthDates.map(({dateStr,cur})=>{
+                  const comp=getCompleted(dateStr);
+                  const conf=isDateConfirmed(dateStr);
+                  const v=getDateVotes(dateStr);
+                  const isToday=dateStr===todayStr;
+                  const dow=new Date(dateStr).getDay();
+                  const rec=getDayRecord(dateStr);
+                  const sieonItems=rec["시은"]||[];
+                  const jisuItems=rec["지수"]||[];
+                  const hasRecords=sieonItems.length>0||jisuItems.length>0;
+                  return(
+                    <div key={dateStr}
+                      onClick={()=>cur&&(comp||conf)&&setMonthDetailDay(dateStr)}
+                      style={{minHeight:44,borderRadius:8,display:"flex",flexDirection:"column",alignItems:"center",padding:"4px 2px 5px",background:comp?"var(--green-dim)":conf?"rgba(255,77,141,0.13)":isToday?"var(--yellow-dim)":"transparent",border:`1px solid ${comp?"var(--green-border)":conf?"rgba(255,77,141,0.35)":isToday?"var(--yellow-border)":"transparent"}`,opacity:cur?1:0.25,cursor:cur&&(comp||conf)?"pointer":"default",transition:"all .15s"}}>
+                      {/* 날짜 숫자 */}
+                      <span style={{fontSize:10,fontWeight:isToday?900:500,color:comp?"var(--green)":conf?"#FF4D8D":isToday?"var(--yellow)":dow===0?"#FF6B6B":dow===6?"#6B8BFF":"var(--text)",lineHeight:1.2,marginBottom:2}}>
+                        {new Date(dateStr).getDate()}
+                      </span>
+                      {/* 완료 기록 태그들 */}
+                      {comp&&hasRecords&&(
+                        <div style={{display:"flex",flexDirection:"column",gap:1,width:"100%",alignItems:"stretch"}}>
+                          {sieonItems.slice(0,2).map(r=>(
+                            <div key={r.id} style={{background:"rgba(255,77,141,0.18)",borderRadius:3,padding:"1px 3px",fontSize:7,color:"#FF4D8D",fontWeight:700,lineHeight:1.3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:"100%"}}>
+                              {r.text}
+                            </div>
+                          ))}
+                          {jisuItems.slice(0,2).map(r=>(
+                            <div key={r.id} style={{background:"rgba(155,89,245,0.18)",borderRadius:3,padding:"1px 3px",fontSize:7,color:"#9B59F5",fontWeight:700,lineHeight:1.3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:"100%"}}>
+                              {r.text}
+                            </div>
+                          ))}
+                          {(sieonItems.length+jisuItems.length)>4&&(
+                            <div style={{fontSize:6,color:"var(--text-faint)",textAlign:"center"}}>+{sieonItems.length+jisuItems.length-4}개</div>
+                          )}
+                        </div>
+                      )}
+                      {/* 투표 점 (기록 없을 때) */}
+                      {!comp&&(v.includes("시은")||v.includes("지수"))&&(
+                        <div style={{display:"flex",gap:1,marginTop:1}}>
+                          {v.includes("시은")&&<div style={{width:3,height:3,borderRadius:"50%",background:"#FF4D8D"}}/>}
+                          {v.includes("지수")&&<div style={{width:3,height:3,borderRadius:"50%",background:"#9B59F5"}}/>}
+                        </div>
+                      )}
+                      {/* 확정 아이콘 */}
+                      {conf&&!comp&&<span style={{fontSize:7,marginTop:1}}>📌</span>}
+                    </div>
+                  );
+                })}
+              </div>
 
-          return (
-            <div key={idx} className={`message ${msg.role} ${msg.type || ''}`}>
-              <p>{msg.content}</p>
+              <div style={{display:"flex",gap:10,marginTop:10,flexWrap:"wrap",justifyContent:"center"}}>
+                {[["var(--green)","완료"],["#FF4D8D","약속확정"],["var(--yellow)","오늘"],["#FF4D8D","시은",true],["#9B59F5","지수",true]].map(([color,label,dot])=>(
+                  <div key={label} style={{display:"flex",alignItems:"center",gap:4}}>
+                    <div style={{width:dot?5:8,height:dot?5:8,borderRadius:"50%",background:color}}/>
+                    <span style={{fontSize:9,color:"var(--text-muted)"}}>{label}{dot?" 기록":""}</span>
+                  </div>
+                ))}
+              </div>
             </div>
-          );
-        })}
-        
-        {isLoading && (
-          <div className="message loading">
-            <div className="typing-indicator">
-              <span></span>
-              <span></span>
-              <span></span>
-            </div>
-          </div>
-        )}
-        
-        <div ref={messagesEndRef} />
-      </div>
 
-      {/* 입력 영역 */}
-      <div className="input-container">
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyPress={handleKeyPress}
-          placeholder="선택하거나 직접 입력하세요..."
-          disabled={isLoading}
-        />
-        <button onClick={handleSend} disabled={isLoading || !input.trim()}>
-          전송
-        </button>
-        
-        {/* 엔딩 확인 버튼 */}
-        {avgAffection >= 50 && (
-          <button 
-            className="btn-ending"
-            onClick={triggerEnding}
-            title="현재 상태로 엔딩 보기"
-          >
-            🏁
-          </button>
+            {/* 이달 완료 목록 */}
+            {(()=>{
+              const done=monthDates.filter(({cur,dateStr})=>cur&&getCompleted(dateStr)).map(({dateStr})=>dateStr);
+              if(!done.length) return null;
+              return(
+                <div style={{marginTop:11,background:"var(--green-dim)",border:"1px solid var(--green-border)",borderRadius:11,padding:12}}>
+                  <div style={{fontSize:10,fontWeight:700,color:"var(--green)",marginBottom:8}}>{MONTH_NAMES[monthIdx.m]} 완료한 어드민나잇 🌙</div>
+                  {done.map(ds=>{
+                    const rec=getDayRecord(ds);
+                    return(
+                      <div key={ds} style={{marginBottom:10,paddingBottom:8,borderBottom:"1px solid rgba(74,222,128,0.1)"}}>
+                        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
+                          <span style={{fontSize:11,fontWeight:700}}>✅ {fmtFull(ds)} ({getDayLabel(ds)})</span>
+                          <button onClick={()=>{setMonthDetailDay(ds);setCompleteTodoInput({시은:"",지수:""}); }} style={{background:"rgba(74,222,128,0.1)",border:"1px solid var(--green-border)",borderRadius:6,padding:"2px 7px",cursor:"pointer",color:"var(--green)",fontSize:9,fontWeight:700}}>상세</button>
+                        </div>
+                        {MEMBERS.map(mb=>{
+                          const c=M[mb];const items=rec[mb]||[];
+                          if(!items.length)return null;
+                          return(
+                            <div key={mb} style={{display:"flex",flexWrap:"wrap",alignItems:"center",gap:4,paddingLeft:6,marginBottom:2}}>
+                              <span style={{fontSize:9,fontWeight:700,color:c.accent}}>{mb}</span>
+                              {items.map(r=><span key={r.id} style={{fontSize:9,padding:"1px 6px",background:`rgba(${mb==="시은"?"255,77,141":"155,89,245"},0.1)`,borderRadius:999,color:c.accent}}>✦ {r.text}</span>)}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+          </>
         )}
-      </div>
+
+        {/* ════ TODOS ════ */}
+        {tab==="todos"&&(
+          <>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+              <button onClick={prevWeek} style={{background:"var(--surface2)",border:"none",color:"var(--text)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:14}}>‹</button>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:12,fontWeight:700}}>{fmt(weekDates[0])} – {fmt(weekDates[6])}</div>
+                {weekKey===getWeekKey(new Date())&&<div style={{fontSize:9,color:"var(--yellow)",marginTop:1}}>이번 주</div>}
+              </div>
+              <button onClick={nextWeek} style={{background:"var(--surface2)",border:"none",color:"var(--text)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontSize:14}}>›</button>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:12}}>
+              {MEMBERS.map(mb=>{
+                const c=M[mb];const todos=(wd.todos||{})[mb]||[];const doneCnt=todos.filter(t=>t.done).length;
+                return(
+                  <div key={mb} style={{background:"var(--surface2)",border:`1px solid ${c.accent}20`,borderRadius:13,padding:14}}>
+                    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <div style={{width:7,height:7,borderRadius:"50%",background:c.accent}}/>
+                        <span style={{fontWeight:900,fontSize:13}}>{mb}의 할 일</span>
+                      </div>
+                      {todos.length>0&&<span style={{fontSize:10,color:"var(--text-faint)"}}>{doneCnt}/{todos.length}</span>}
+                    </div>
+                    <div style={{display:"flex",gap:6,marginBottom:8}}>
+                      <input value={todoInput[mb]} onChange={e=>setTodoInput(p=>({...p,[mb]:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&addTodo(mb)} placeholder="할 일 추가..." style={{flex:1,background:"rgba(255,255,255,0.05)",border:`1px solid ${c.accent}28`,borderRadius:8,padding:"7px 10px",color:"var(--text)",fontSize:11,outline:"none"}}/>
+                      <button onClick={()=>addTodo(mb)} style={{background:c.accent,border:"none",borderRadius:8,padding:"7px 12px",cursor:"pointer",color:"#fff",fontSize:14,fontWeight:700}}>+</button>
+                    </div>
+                    {todos.length===0
+                      ?<div style={{textAlign:"center",color:"var(--text-faint)",fontSize:10,padding:"8px 0"}}>아직 할 일이 없어요!</div>
+                      :<div style={{display:"flex",flexDirection:"column",gap:5}}>
+                        {todos.map(t=>(
+                          <div key={t.id} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 8px",background:"rgba(255,255,255,0.03)",borderRadius:8}}>
+                            <button onClick={()=>toggleTodo(mb,t.id)} style={{width:17,height:17,borderRadius:5,border:`2px solid ${t.done?c.accent:"rgba(255,255,255,0.15)"}`,background:t.done?c.accent:"transparent",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                              {t.done&&<span style={{color:"#fff",fontSize:9}}>✓</span>}
+                            </button>
+                            <span style={{flex:1,fontSize:11,color:t.done?"var(--text-faint)":"var(--text)",textDecoration:t.done?"line-through":"none"}}>{t.text}</span>
+                            <button onClick={()=>delTodo(mb,t.id)} style={{background:"none",border:"none",color:"var(--text-faint)",cursor:"pointer",fontSize:13}}>×</button>
+                          </div>
+                        ))}
+                      </div>
+                    }
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </main>
     </div>
   );
 }
-
-export default ChatInterface;
